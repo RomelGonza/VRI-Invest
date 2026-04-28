@@ -4,6 +4,8 @@ import streamlit as st
 
 DEFAULT_ENDPOINT = "https://cmsback.vridevops.site/api/grupos-reconocidos"
 
+SYSTEM_FIELDS = {"id", "createdAt", "updatedAt", "publishedAt"}
+
 DEFAULT_FIELD_MAP = {
     "nombre": "nombre",
     "anio": "anio",
@@ -22,6 +24,15 @@ def default_api_field_name(field):
     if key_lower in DEFAULT_FIELD_MAP:
         return DEFAULT_FIELD_MAP[key_lower]
     return key_lower.replace(" ", "_")
+
+
+def match_endpoint_field(field, endpoint_fields):
+    normalized = default_api_field_name(field)
+    if normalized in endpoint_fields:
+        return normalized
+    if field in endpoint_fields:
+        return field
+    return normalized
 
 
 def build_payload(data):
@@ -74,6 +85,68 @@ def post_payload(endpoint, token, payload, timeout):
         return None, exc
 
 
+def build_probe_url(endpoint):
+    if "?" in endpoint:
+        return f"{endpoint}&pagination[pageSize]=1"
+    return f"{endpoint}?pagination[pageSize]=1"
+
+
+def extract_fields_from_record(record):
+    if not isinstance(record, dict):
+        return [], {}
+
+    if "attributes" in record and isinstance(record["attributes"], dict):
+        attributes = record["attributes"]
+        fields = [key for key in attributes.keys() if key not in SYSTEM_FIELDS]
+        return sorted(fields), attributes
+
+    fields = [key for key in record.keys() if key not in SYSTEM_FIELDS]
+    sample = {key: record[key] for key in fields}
+    return sorted(fields), sample
+
+
+def extract_fields_from_response(payload):
+    if isinstance(payload, dict) and "data" in payload:
+        data = payload["data"]
+        if isinstance(data, list) and data:
+            return extract_fields_from_record(data[0])
+        if isinstance(data, dict):
+            return extract_fields_from_record(data)
+
+    if isinstance(payload, list) and payload:
+        return extract_fields_from_record(payload[0])
+
+    if isinstance(payload, dict):
+        return extract_fields_from_record(payload)
+
+    return [], {}
+
+
+def fetch_endpoint_fields(endpoint, token, timeout):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    probe_url = build_probe_url(endpoint)
+    try:
+        response = requests.get(probe_url, headers=headers, timeout=timeout)
+    except requests.RequestException as exc:
+        return None, None, exc
+
+    if response.status_code not in (200, 201):
+        return None, None, f"Codigo {response.status_code}"
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, None, "Respuesta no es JSON"
+
+    fields, sample = extract_fields_from_response(payload)
+    if not fields:
+        return None, None, "No se detectaron campos en el endpoint"
+    return fields, sample, None
+
+
 def test_connection(endpoint, token, timeout):
     headers = {"Content-Type": "application/json"}
     if token:
@@ -85,7 +158,53 @@ def test_connection(endpoint, token, timeout):
         return exc
 
 
+def coerce_value(value):
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return ""
+        if trimmed.startswith("{") or trimmed.startswith("["):
+            try:
+                return json.loads(trimmed)
+            except json.JSONDecodeError:
+                return trimmed
+        return trimmed
+    return value
+
+
+def render_dynamic_fields(fields, sample):
+    values = {}
+    for field in fields:
+        sample_value = sample.get(field) if isinstance(sample, dict) else None
+        label = field.replace("_", " ").title()
+        key = f"field_{field}"
+
+        if isinstance(sample_value, bool):
+            values[field] = st.checkbox(label, value=sample_value, key=key)
+        elif isinstance(sample_value, int) and not isinstance(sample_value, bool):
+            values[field] = st.number_input(label, value=sample_value, step=1, key=key)
+        elif isinstance(sample_value, float):
+            values[field] = st.number_input(label, value=sample_value, step=0.01, key=key)
+        elif isinstance(sample_value, (list, dict)):
+            raw = json.dumps(sample_value, ensure_ascii=False, indent=2)
+            values[field] = st.text_area(label, value=raw, key=key)
+        else:
+            default_value = "" if sample_value is None else str(sample_value)
+            if field.lower() in {"integrantes", "descripcion", "detalle"} or "\n" in default_value:
+                values[field] = st.text_area(label, value=default_value, key=key)
+            else:
+                values[field] = st.text_input(label, value=default_value, key=key)
+
+    return values
+
+
 st.set_page_config(page_title="Carga Strapi", layout="centered")
+
+if "endpoint_fields" not in st.session_state:
+    st.session_state.endpoint_fields = []
+    st.session_state.endpoint_sample = {}
+    st.session_state.endpoint_url = ""
+    st.session_state.endpoint_error = None
 
 st.title("Carga a Strapi: grupos reconocidos")
 st.caption("Envia un registro individual al endpoint configurado.")
@@ -102,6 +221,19 @@ with st.sidebar:
             st.write(f"Codigo: {result.status_code}")
             if result.status_code in (200, 201):
                 st.success("Conexion OK")
+                fields, sample, error = fetch_endpoint_fields(endpoint, token, timeout)
+                if error:
+                    st.session_state.endpoint_fields = []
+                    st.session_state.endpoint_sample = {}
+                    st.session_state.endpoint_url = endpoint
+                    st.session_state.endpoint_error = error
+                    st.warning(f"No se pudo detectar campos: {error}")
+                else:
+                    st.session_state.endpoint_fields = fields
+                    st.session_state.endpoint_sample = sample
+                    st.session_state.endpoint_url = endpoint
+                    st.session_state.endpoint_error = None
+                    st.success(f"Campos detectados: {len(fields)}")
             elif result.status_code in (401, 403):
                 st.warning("Conexion OK, pero token no autorizado")
             else:
@@ -109,41 +241,55 @@ with st.sidebar:
         else:
             st.error(f"Error de conexion: {result}")
 
+    if st.session_state.endpoint_fields and st.session_state.endpoint_url == endpoint:
+        st.caption(f"Campos en endpoint: {', '.join(st.session_state.endpoint_fields)}")
+
 st.subheader("Datos del grupo")
 tabs = st.tabs(["Formulario", "JSON"])
 
 with tabs[0]:
     with st.form("registro_form"):
-        nombre = st.text_input("Nombre")
-        anio = st.number_input("Anio", min_value=1900, max_value=2100, value=2025, step=1)
-        facultad = st.text_input("Facultad")
-        escuela = st.text_input("Escuela")
-        responsable = st.text_input("Responsable")
-        linea = st.text_input("Linea")
-        integrantes = st.text_area("Integrantes", help="Uno por linea")
+        endpoint_fields = st.session_state.endpoint_fields
+        endpoint_sample = st.session_state.endpoint_sample
+
+        if endpoint_fields:
+            st.info("Campos cargados desde el endpoint.")
+            values = render_dynamic_fields(endpoint_fields, endpoint_sample)
+        else:
+            st.warning("No hay campos del endpoint. Usa 'Probar conexion' en la barra lateral.")
+            values = {
+                "nombre": st.text_input("Nombre"),
+                "anio": st.number_input("Anio", min_value=1900, max_value=2100, value=2025, step=1),
+                "facultad": st.text_input("Facultad"),
+                "escuela": st.text_input("Escuela"),
+                "responsable": st.text_input("Responsable"),
+                "linea": st.text_input("Linea"),
+                "integrantes": st.text_area("Integrantes", help="Uno por linea"),
+            }
+
         show_payload = st.checkbox("Mostrar payload antes de enviar", value=False)
         submitted = st.form_submit_button("Enviar registro")
 
     if submitted:
-        values = {
-            "nombre": nombre.strip(),
-            "anio": str(int(anio)),
-            "facultad": facultad.strip(),
-            "escuela": escuela.strip(),
-            "responsable": responsable.strip(),
-            "linea": linea.strip(),
-            "integrantes": integrantes.strip(),
-        }
-
-        missing = [key for key, value in values.items() if not value]
-        if missing:
-            st.error(f"Campos vacios: {', '.join(missing)}")
-        elif not endpoint.strip():
+        if not endpoint.strip():
             st.error("Endpoint vacio")
         elif not token.strip():
             st.error("Token vacio")
         else:
-            payload = build_payload(values)
+            if endpoint_fields:
+                data = {field: coerce_value(values.get(field, "")) for field in endpoint_fields}
+            else:
+                data = {
+                    "nombre": str(values.get("nombre", "")).strip(),
+                    "anio": str(int(values.get("anio", 0))),
+                    "facultad": str(values.get("facultad", "")).strip(),
+                    "escuela": str(values.get("escuela", "")).strip(),
+                    "responsable": str(values.get("responsable", "")).strip(),
+                    "linea": str(values.get("linea", "")).strip(),
+                    "integrantes": str(values.get("integrantes", "")).strip(),
+                }
+
+            payload = build_payload(data)
 
             if show_payload:
                 st.code(json.dumps(payload, ensure_ascii=False, indent=2), language="json")
@@ -180,6 +326,9 @@ with tabs[1]:
         record_count = len(records)
         st.write(f"Registros detectados: {record_count}")
 
+        endpoint_fields = st.session_state.endpoint_fields
+        endpoint_field_set = set(endpoint_fields)
+
         send_all = False
         if record_count > 1:
             send_all = st.checkbox(f"Enviar todos los registros ({record_count})", value=False)
@@ -201,7 +350,24 @@ with tabs[1]:
         else:
             all_fields = list(selected_record.keys())
 
-        fields = st.multiselect("Campos a enviar", options=all_fields, default=all_fields)
+        normalized_fields = {field: match_endpoint_field(field, endpoint_fields) for field in all_fields}
+        normalized_field_set = set(normalized_fields.values())
+        if endpoint_fields:
+            missing_fields = sorted(endpoint_field_set - normalized_field_set)
+            extra_fields = sorted(normalized_field_set - endpoint_field_set)
+            if missing_fields:
+                st.warning(f"Faltan campos del endpoint en el JSON: {', '.join(missing_fields)}")
+            if extra_fields:
+                st.warning(f"Campos del JSON no existen en el endpoint: {', '.join(extra_fields)}")
+
+        if endpoint_fields:
+            default_fields = [
+                field for field in all_fields if normalized_fields[field] in endpoint_field_set
+            ]
+        else:
+            default_fields = all_fields
+
+        fields = st.multiselect("Campos a enviar", options=all_fields, default=default_fields)
         edit_field_names = st.checkbox("Editar nombres de campo (API)", value=False)
 
         field_mapping = {}
@@ -210,12 +376,12 @@ with tabs[1]:
             for field in fields:
                 field_mapping[field] = st.text_input(
                     f"{field} ->",
-                    value=default_api_field_name(field),
+                    value=match_endpoint_field(field, endpoint_fields),
                     key=f"map_{field}",
                 )
         else:
             for field in fields:
-                field_mapping[field] = default_api_field_name(field)
+                field_mapping[field] = match_endpoint_field(field, endpoint_fields)
 
         show_payload_json = st.checkbox(
             "Mostrar payload antes de enviar",
