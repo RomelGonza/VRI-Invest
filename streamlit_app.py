@@ -172,28 +172,31 @@ def coerce_value(value):
     return value
 
 
-def render_dynamic_fields(fields, sample):
+def render_dynamic_fields(fields, sample, use_sample_values=False):
     values = {}
     for field in fields:
         sample_value = sample.get(field) if isinstance(sample, dict) else None
+        default_value = sample_value if use_sample_values else None
         label = field.replace("_", " ").title()
         key = f"field_{field}"
 
         if isinstance(sample_value, bool):
-            values[field] = st.checkbox(label, value=sample_value, key=key)
+            values[field] = st.checkbox(label, value=bool(default_value), key=key)
         elif isinstance(sample_value, int) and not isinstance(sample_value, bool):
-            values[field] = st.number_input(label, value=sample_value, step=1, key=key)
+            value = default_value if isinstance(default_value, int) else 0
+            values[field] = st.number_input(label, value=value, step=1, key=key)
         elif isinstance(sample_value, float):
-            values[field] = st.number_input(label, value=sample_value, step=0.01, key=key)
+            value = default_value if isinstance(default_value, float) else 0.0
+            values[field] = st.number_input(label, value=value, step=0.01, key=key)
         elif isinstance(sample_value, (list, dict)):
-            raw = json.dumps(sample_value, ensure_ascii=False, indent=2)
+            raw = json.dumps(sample_value, ensure_ascii=False, indent=2) if default_value else ""
             values[field] = st.text_area(label, value=raw, key=key)
         else:
-            default_value = "" if sample_value is None else str(sample_value)
-            if field.lower() in {"integrantes", "descripcion", "detalle"} or "\n" in default_value:
-                values[field] = st.text_area(label, value=default_value, key=key)
+            raw_value = "" if default_value is None else str(default_value)
+            if field.lower() in {"integrantes", "descripcion", "detalle"} or "\n" in raw_value:
+                values[field] = st.text_area(label, value=raw_value, key=key)
             else:
-                values[field] = st.text_input(label, value=default_value, key=key)
+                values[field] = st.text_input(label, value=raw_value, key=key)
 
     return values
 
@@ -206,7 +209,7 @@ if "endpoint_fields" not in st.session_state:
     st.session_state.endpoint_url = ""
     st.session_state.endpoint_error = None
 
-st.title("Carga a Strapi: grupos reconocidos")
+st.title("Carga a Strapi: VRI grupos de investigacion")
 st.caption("Envia un registro individual al endpoint configurado.")
 
 with st.sidebar:
@@ -254,7 +257,7 @@ with tabs[0]:
 
         if endpoint_fields:
             st.info("Campos cargados desde el endpoint.")
-            values = render_dynamic_fields(endpoint_fields, endpoint_sample)
+            values = render_dynamic_fields(endpoint_fields, endpoint_sample, use_sample_values=False)
         else:
             st.warning("No hay campos del endpoint. Usa 'Probar conexion' en la barra lateral.")
             values = {
