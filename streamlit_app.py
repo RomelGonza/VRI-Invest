@@ -4,7 +4,7 @@ import streamlit as st
 
 DEFAULT_ENDPOINT = "https://cmsback.vridevops.site/api/grupos-reconocidos"
 
-SYSTEM_FIELDS = {"id", "createdAt", "updatedAt", "publishedAt"}
+SYSTEM_FIELDS = {"id", "createdAt", "updatedAt", "publishedAt", "documentId"}
 
 DEFAULT_FIELD_MAP = {
     "nombre": "nombre",
